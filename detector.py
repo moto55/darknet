@@ -132,7 +132,7 @@ if os.name == "nt":
             lib = CDLL(winGPUdll, RTLD_GLOBAL)
             print("Environment variables indicated a CPU run, but we didn't find `"+winNoGPUdll+"`. Trying a GPU run anyway.")
 else:
-    lib = CDLL("./libdarknet.so", RTLD_GLOBAL)
+    lib = CDLL("./inference/models/darknet/libdarknet.so", RTLD_GLOBAL)
 lib.network_width.argtypes = [c_void_p]
 lib.network_width.restype = c_int
 lib.network_height.argtypes = [c_void_p]
@@ -226,7 +226,7 @@ network_predict_batch.restype = POINTER(DETNUMPAIR)
 
 class Detector:
 
-    def __init__(self, configPath = "./cfg/yolov3.cfg", weightPath = "yolov3.weights", metaPath= "./cfg/coco.data"):
+    def __init__(self, configPath: str, weightPath: str, metaPath: str):
 
         # Import the global variables. This lets us instance Darknet once, then just call performDetect() again without instancing again
 
@@ -240,6 +240,7 @@ class Detector:
         self.metaMain = load_meta(metaPath.encode("ascii"))
         # In Python 3, the metafile default access craps out on Windows (but not Linux)
         # Read the names file and create a list to feed to detect
+        self.altNames = None
         try:
             with open(metaPath) as metaFH:
                 metaContents = metaFH.read()
@@ -253,7 +254,7 @@ class Detector:
                     if os.path.exists(result):
                         with open(result) as namesFH:
                             namesList = namesFH.read().strip().split("\n")
-                            altNames = [x.strip() for x in namesList]
+                            self.altNames = [x.strip() for x in namesList]
                 except TypeError:
                     pass
         except Exception:
@@ -263,7 +264,7 @@ class Detector:
         self.network_width = lib.network_width(self.netMain)
         self.darknet_image = make_image(self.network_width, self.network_height, 3)
 
-    def detect(self, image: np.ndarray, thresh=.5, hier_thresh=.5, nms=.45):
+    def detect(self, image: np.ndarray, thresh=.5, hier_thresh=.5, nms=.45, debug=False):
         """
         Performs the meat of the detection
         """
@@ -276,19 +277,20 @@ class Detector:
         timer.append(('resize_image', time.time()))
         copy_image_from_bytes(self.darknet_image, img_resized.tobytes())
         timer.append(('image_to_darknet', time.time()))
-        ret = self._detect_image(thresh, hier_thresh, nms)
+        ret = self._detect_image(thresh, hier_thresh, nms, im_height=image.shape[0], im_width=image.shape[1])
         timer.append(('detect_image', time.time()))
 
-        for i in range(1, len(timer)):
-            period = timer[i][1] - timer[i - 1][1]
-            if period == 0:
-                continue
-            print(f'event: {timer[i][0]}, time: {round(period, 4)}')
-        print()
+        if debug:
+            for i in range(1, len(timer)):
+                period = timer[i][1] - timer[i - 1][1]
+                if period == 0:
+                    continue
+                print(f'event: {timer[i][0]}, time: {round(period, 4)}')
+            print()
 
         return ret
 
-    def _detect_image(self, thresh=.5, hier_thresh=.5, nms=.45, debug=False):
+    def _detect_image(self, thresh, hier_thresh, nms, im_height, im_width, debug=False):
         num = c_int(0)
         if debug: print("Assigned num")
         pnum = pointer(num)
@@ -299,7 +301,7 @@ class Detector:
         #letter_box = 1
         if debug: print("did prediction")
         #dets = get_network_boxes(self.netMain, custom_image_bgr.shape[1], custom_image_bgr.shape[0], thresh, hier_thresh, None, 0, pnum, letter_box) # OpenCV
-        dets = get_network_boxes(self.netMain, self.darknet_image.w, self.darknet_image.h, thresh, hier_thresh, None, 0, pnum, letter_box)
+        dets = get_network_boxes(self.netMain, im_width, im_height, thresh, hier_thresh, None, 0, pnum, letter_box)
         if debug: print("Got dets")
         num = pnum[0]
         if debug: print("got zeroth index of pnum")
@@ -315,10 +317,10 @@ class Detector:
                 if debug: print("Class-ranging on "+str(i)+" of "+str(self.metaMain.classes)+"= "+str(dets[j].prob[i]))
                 if dets[j].prob[i] > 0:
                     b = dets[j].bbox
-                    if altNames is None:
+                    if self.altNames is None:
                         nameTag = self.metaMain.names[i]
                     else:
-                        nameTag = altNames[i]
+                        nameTag = self.altNames[i]
                     if debug:
                         print("Got bbox", b)
                         print(nameTag)
@@ -343,7 +345,43 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    detector = Detector(args.configPath, args.weightPath)
 
+    image_pathes = sorted(glob.glob(f'{args.imagesPath}/*'))
+    for image_path in image_pathes:
+        im_name = re.findall(f'{args.imagesPath}/(.*)\.', image_path)[0]
+        timer = []
+        timer.append(('start', time.time()))
+        img = cv2.imread(image_path)
+        timer.append(('read_image', time.time()))
+        detections = detector.detect(img, args.thresh)  # image_path.encode("ascii")
+        timer.append(('detect', time.time()))
+        for detection in detections:
+            xc = detection[2][0]
+            yc = detection[2][1]
+            w = detection[2][2]
+            h = detection[2][3]
 
-    # Uncomment the following line to see batch inference working
-    # print(performBatchDetect())
+            x1 = int(xc - w / 2)
+            y1 = int(yc - h / 2)
+            x2 = int(xc + w / 2)
+            y2 = int(yc + h / 2)
+
+            label = detection[0]
+            confidence = detection[1]
+            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2, 1)
+            cv2.putText(img, f'{label} {round(confidence, 2)}',
+                        (x1, y1), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 2)
+        timer.append(('draw_bboxes', time.time()))
+        cv2.imwrite(f'{args.out_images_path}/{im_name}.jpg', img)
+        timer.append(('save image', time.time()))
+
+        total_time = timer[-1][1] - timer[0][1]
+        total_fps = 1 / total_time
+        print(f'TOTAL FPS: {round(total_fps, 2)}')
+        for i in range(1, len(timer)):
+            period = timer[i][1] - timer[i - 1][1]
+            if period == 0:
+                continue
+            print(f'event: {timer[i][0]}, time: {round(period, 4)}, part: {round(period / total_time * 100, 2)}%')
+        print()

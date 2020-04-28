@@ -27,10 +27,18 @@ Windows Python 2.7 version: https://github.com/AlexeyAB/darknet/blob/fc496d52bf2
 @date: 20180503
 """
 #pylint: disable=R, W0401, W0614, W0703
+import argparse
+import glob
+import time
 from ctypes import *
 import math
 import random
 import os
+import re
+
+import cv2
+import numpy as np
+
 
 def sample(probs):
     s = sum(probs)
@@ -124,7 +132,7 @@ if os.name == "nt":
             lib = CDLL(winGPUdll, RTLD_GLOBAL)
             print("Environment variables indicated a CPU run, but we didn't find `"+winNoGPUdll+"`. Trying a GPU run anyway.")
 else:
-    lib = CDLL("./libdarknet.so", RTLD_GLOBAL)
+    lib = CDLL("./inference/models/darknet/libdarknet.so", RTLD_GLOBAL)
 lib.network_width.argtypes = [c_void_p]
 lib.network_width.restype = c_int
 lib.network_height.argtypes = [c_void_p]
@@ -245,16 +253,29 @@ def classify(net, meta, im):
     res = sorted(res, key=lambda x: -x[1])
     return res
 
-def detect(net, meta, image, thresh=.5, hier_thresh=.5, nms=.45, debug= False):
+def detect(net, meta, image: np.ndarray, thresh=.5, hier_thresh=.5, nms=.45, debug= False):
     """
     Performs the meat of the detection
     """
     #pylint: disable= C0321
-    im = load_image(image, 0, 0)
-    if debug: print("Loaded image")
-    ret = detect_image(net, meta, im, thresh, hier_thresh, nms, debug)
-    free_image(im)
-    if debug: print("freed image")
+
+    timer = []
+    timer.append(('start', time.time()))
+    # im = load_image(image, 0, 0)
+    img_resized = cv2.resize(image, (network_width(netMain), network_height(netMain)))
+    timer.append(('resize_image', time.time()))
+    copy_image_from_bytes(darknet_image, img_resized.tobytes())
+    timer.append(('image_to_darknet', time.time()))
+    ret = detect_image(net, meta, darknet_image, thresh, hier_thresh, nms, debug)
+    timer.append(('detect_image', time.time()))
+
+    for i in range(1, len(timer)):
+        period = timer[i][1] - timer[i - 1][1]
+        if period == 0:
+            continue
+        print(f'event: {timer[i][0]}, time: {round(period, 4)}')
+    print()
+
     return ret
 
 def detect_image(net, meta, im, thresh=.5, hier_thresh=.5, nms=.45, debug= False):
@@ -313,7 +334,8 @@ netMain = None
 metaMain = None
 altNames = None
 
-def performDetect(imagePath="data/dog.jpg", thresh= 0.25, configPath = "./cfg/yolov3.cfg", weightPath = "yolov3.weights", metaPath= "./cfg/coco.data", showImage= True, makeImageOnly = False, initOnly= False):
+
+def performDetect(imagesPath, out_images_path, thresh= 0.25, configPath = "./cfg/yolov3.cfg", weightPath = "yolov3.weights", metaPath= "./cfg/coco.data", showImage= True, makeImageOnly = False, initOnly= False):
     """
     Convenience function to handle the detection and returns of objects.
 
@@ -397,64 +419,51 @@ def performDetect(imagePath="data/dog.jpg", thresh= 0.25, configPath = "./cfg/yo
     if initOnly:
         print("Initialized detector")
         return None
-    if not os.path.exists(imagePath):
-        raise ValueError("Invalid image path `"+os.path.abspath(imagePath)+"`")
     # Do the detection
     #detections = detect(netMain, metaMain, imagePath, thresh)	# if is used cv2.imread(image)
-    detections = detect(netMain, metaMain, imagePath.encode("ascii"), thresh)
-    if showImage:
-        try:
-            from skimage import io, draw
-            import numpy as np
-            image = io.imread(imagePath)
-            print("*** "+str(len(detections))+" Results, color coded by confidence ***")
-            imcaption = []
-            for detection in detections:
-                label = detection[0]
-                confidence = detection[1]
-                pstring = label+": "+str(np.rint(100 * confidence))+"%"
-                imcaption.append(pstring)
-                print(pstring)
-                bounds = detection[2]
-                shape = image.shape
-                # x = shape[1]
-                # xExtent = int(x * bounds[2] / 100)
-                # y = shape[0]
-                # yExtent = int(y * bounds[3] / 100)
-                yExtent = int(bounds[3])
-                xEntent = int(bounds[2])
-                # Coordinates are around the center
-                xCoord = int(bounds[0] - bounds[2]/2)
-                yCoord = int(bounds[1] - bounds[3]/2)
-                boundingBox = [
-                    [xCoord, yCoord],
-                    [xCoord, yCoord + yExtent],
-                    [xCoord + xEntent, yCoord + yExtent],
-                    [xCoord + xEntent, yCoord]
-                ]
-                # Wiggle it around to make a 3px border
-                rr, cc = draw.polygon_perimeter([x[1] for x in boundingBox], [x[0] for x in boundingBox], shape= shape)
-                rr2, cc2 = draw.polygon_perimeter([x[1] + 1 for x in boundingBox], [x[0] for x in boundingBox], shape= shape)
-                rr3, cc3 = draw.polygon_perimeter([x[1] - 1 for x in boundingBox], [x[0] for x in boundingBox], shape= shape)
-                rr4, cc4 = draw.polygon_perimeter([x[1] for x in boundingBox], [x[0] + 1 for x in boundingBox], shape= shape)
-                rr5, cc5 = draw.polygon_perimeter([x[1] for x in boundingBox], [x[0] - 1 for x in boundingBox], shape= shape)
-                boxColor = (int(255 * (1 - (confidence ** 2))), int(255 * (confidence ** 2)), 0)
-                draw.set_color(image, (rr, cc), boxColor, alpha= 0.8)
-                draw.set_color(image, (rr2, cc2), boxColor, alpha= 0.8)
-                draw.set_color(image, (rr3, cc3), boxColor, alpha= 0.8)
-                draw.set_color(image, (rr4, cc4), boxColor, alpha= 0.8)
-                draw.set_color(image, (rr5, cc5), boxColor, alpha= 0.8)
-            if not makeImageOnly:
-                io.imshow(image)
-                io.show()
-            detections = {
-                "detections": detections,
-                "image": image,
-                "caption": "\n<br/>".join(imcaption)
-            }
-        except Exception as e:
-            print("Unable to show image: "+str(e))
-    return detections
+
+    global darknet_image
+    darknet_image = make_image(network_width(netMain), network_height(netMain), 3)
+
+    image_pathes = sorted(glob.glob(f'{imagesPath}/*'))
+    for image_path in image_pathes:
+        im_name = re.findall(f'{imagesPath}/(.*)\.', image_path)[0]
+        timer = []
+        timer.append(('start', time.time()))
+        img = cv2.imread(image_path)
+        timer.append(('read_image', time.time()))
+        detections = detect(netMain, metaMain, img, thresh)  # image_path.encode("ascii")
+        timer.append(('detect', time.time()))
+        for detection in detections:
+            xc = detection[2][0]
+            yc = detection[2][1]
+            w = detection[2][2]
+            h = detection[2][3]
+
+            x1 = int(xc - w/2)
+            y1 = int(yc - h/2)
+            x2 = int(xc + w/2)
+            y2 = int(yc + h/2)
+
+            label = detection[0]
+            confidence = detection[1]
+            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2, 1)
+            cv2.putText(img, f'{label} {round(confidence, 2)}',
+                        (x1, y1), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 2)
+        timer.append(('draw_bboxes', time.time()))
+        cv2.imwrite(f'{out_images_path}/{im_name}.jpg', img)
+        timer.append(('save image', time.time()))
+
+        total_time = timer[-1][1] - timer[0][1]
+        total_fps = 1 / total_time
+        print(f'TOTAL FPS: {round(total_fps, 2)}')
+        for i in range(1, len(timer)):
+            period = timer[i][1] - timer[i - 1][1]
+            if period == 0:
+                continue
+            print(f'event: {timer[i][0]}, time: {round(period, 4)}, part: {round(period / total_time * 100, 2)}%')
+        print()
+
 
 def performBatchDetect(thresh= 0.25, configPath = "./cfg/yolov3.cfg", weightPath = "yolov3.weights", metaPath= "./cfg/coco.data", hier_thresh=.5, nms=.45, batch_size=3):
     import cv2
@@ -519,9 +528,26 @@ def performBatchDetect(thresh= 0.25, configPath = "./cfg/yolov3.cfg", weightPath
         batch_scores.append(scores)
         batch_classes.append(classes)
     free_batch_detections(batch_dets, batch_size)
-    return batch_boxes, batch_scores, batch_classes    
+    return batch_boxes, batch_scores, batch_classes
+
 
 if __name__ == "__main__":
-    print(performDetect())
-    #Uncomment the following line to see batch inference working 
-    #print(performBatchDetect())
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--imagesPath', type=str)
+    parser.add_argument('--out_images_path', type=str)
+    parser.add_argument('--thresh', type=float)
+    parser.add_argument('--configPath', type=str)
+    parser.add_argument('--weightPath', type=str)
+
+    args = parser.parse_args()
+
+    performDetect(imagesPath=args.imagesPath,
+                  out_images_path=args.out_images_path,
+                  thresh=args.thresh,
+                  configPath=args.configPath,
+                  weightPath=args.weightPath)
+
+    # Uncomment the following line to see batch inference working
+    # print(performBatchDetect())
+
+
